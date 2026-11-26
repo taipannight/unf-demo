@@ -54,18 +54,73 @@ def health():
     return {"status": "ok"}
 
 
-# ---------- чтение ----------
+# ---------- Номенклатура, остатки и маржинальность ----------
 @router.get("/nomenclature")
 def nomenclature(limit: int = Query(500, ge=1, le=5000), offset: int = Query(0, ge=0)):
     return fetch(
         """SELECT n.code, n.name, g.name AS group_name, n.unit, n.is_service,
-                  n.vat_rate, n.retail_price, n.purchase_price
-           FROM nomenclature n LEFT JOIN nomenclature_groups g ON g.id = n.group_id
+                  n.vat_rate, n.retail_price, n.purchase_price,
+                  (n.retail_price - n.purchase_price) AS margin_amount,
+                  ROUND(((n.retail_price - n.purchase_price)
+                         / NULLIF(n.retail_price, 0) * 100), 2) AS margin_percent,
+                  ROUND(((n.retail_price - n.purchase_price)
+                         / NULLIF(n.purchase_price, 0) * 100), 2) AS markup_percent,
+                  COALESCE(st.qty_on_hand, 0) AS qty_on_hand
+           FROM nomenclature n
+           LEFT JOIN nomenclature_groups g ON g.id = n.group_id
+           LEFT JOIN (
+               SELECT movements.item_id, SUM(movements.qty_delta) AS qty_on_hand
+               FROM (
+                   SELECT pl.item_id, pl.qty AS qty_delta
+                   FROM purchase_lines pl
+                   JOIN purchase_docs pd ON pd.id = pl.doc_id
+                   UNION ALL
+                   SELECT sl.item_id, -sl.qty AS qty_delta
+                   FROM sales_lines sl
+                   JOIN sales_docs sd ON sd.id = sl.doc_id
+               ) movements
+               GROUP BY movements.item_id
+           ) st ON st.item_id = n.id
            ORDER BY n.code LIMIT %s OFFSET %s""",
         (limit, offset),
     )
 
 
+@router.get("/stock")
+def stock(
+    warehouse_id: Optional[int] = None,
+    include_zero: bool = Query(False),
+    limit: int = Query(5000, ge=1, le=10000),
+    offset: int = Query(0, ge=0),
+):
+    rows = fetch(
+        """WITH movements AS (
+               SELECT pl.item_id, pd.warehouse_id, pl.qty AS qty_delta
+               FROM purchase_lines pl
+               JOIN purchase_docs pd ON pd.id = pl.doc_id
+               UNION ALL
+               SELECT sl.item_id, sd.warehouse_id, -sl.qty AS qty_delta
+               FROM sales_lines sl
+               JOIN sales_docs sd ON sd.id = sl.doc_id
+           )
+           SELECT n.id AS item_id, n.code, n.name, n.unit,
+                  w.id AS warehouse_id, w.name AS warehouse_name,
+                  COALESCE(SUM(m.qty_delta), 0) AS qty_on_hand
+           FROM nomenclature n
+           CROSS JOIN warehouses w
+           LEFT JOIN movements m
+             ON m.item_id = n.id AND m.warehouse_id = w.id
+           WHERE (%s::int IS NULL OR w.id = %s::int)
+           GROUP BY n.id, n.code, n.name, n.unit, w.id, w.name
+           HAVING (%s::boolean OR COALESCE(SUM(m.qty_delta), 0) <> 0)
+           ORDER BY n.code, w.id
+           LIMIT %s OFFSET %s""",
+        (warehouse_id, warehouse_id, include_zero, limit, offset),
+    )
+    return rows
+
+
+# ---------- Контрагенты, сотрудники, продажи ----------
 @router.get("/counterparties")
 def counterparties(kind: Optional[Literal["Покупатель", "Поставщик"]] = None,
                    limit: int = Query(500, ge=1, le=5000), offset: int = Query(0, ge=0)):
@@ -114,15 +169,19 @@ def sale(doc_id: int):
     if not head:
         raise HTTPException(status_code=404, detail="Документ не найден")
     lines = fetch(
-        """SELECT n.code, n.name, l.qty, l.price, l.amount
-           FROM sales_lines l JOIN nomenclature n ON n.id = l.item_id
+        """SELECT n.code, n.name, l.qty, l.price, l.amount,
+                  n.purchase_price,
+                  (l.price - n.purchase_price) AS margin_per_unit,
+                  (l.qty * (l.price - n.purchase_price)) AS margin_total
+           FROM sales_lines l
+           JOIN nomenclature n ON n.id = l.item_id
            WHERE l.doc_id = %s ORDER BY l.id""",
         (doc_id,),
     )
     return {**head[0], "lines": lines}
 
 
-# ---------- запись ----------
+# ---------- Запись ----------
 class CounterpartyIn(BaseModel):
     name: str = Field(min_length=1, max_length=300)
     inn: Optional[str] = Field(default=None, max_length=12)
